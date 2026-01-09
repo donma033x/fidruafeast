@@ -2,14 +2,9 @@
 
 **Samoyed Resource Muncher** - Let Fidrua munch your idle VPS resources!
 
-```
-                                   __   __
-                                  /  \_/  \
-    .---------------.            (  o   o  )
-    | [*]  :::::::: |_ _ _ _ _ _ _/    V    \
-    | ============= |____________(  \___/  )
-    |_______________|              \_______/
-```
+<p align="center">
+  <img src="assets/banner.png" alt="Fidrua munching on server" width="600">
+</p>
 
 ## 🤔 What is this?
 

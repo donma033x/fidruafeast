@@ -575,17 +575,25 @@ func (rc *ResourceConsumer) getStatusString() string {
 	sb.WriteString(fmt.Sprintf("    Disk:   %s total | %s others | %s Fidrua ate\n",
 		formatBytes(totalDisk), formatBytes(otherDiskUsed), formatBytes(ourDiskUsed)))
 	
-	// Show per-disk details if multiple disks
-	if len(rc.disks) > 1 {
+	// Show per-disk details
+	if len(rc.disks) >= 1 {
 		sb.WriteString("\n")
 		sb.WriteString("  \033[2m💾 DISKS\033[0m\n")
+		targetUsagePct := 100 - rc.targetFreeDisk
 		rc.mu.Lock()
 		for _, disk := range rc.disks {
 			total, otherUsed, _ := rc.getDiskInfo(disk)
 			if total > 0 {
+				otherPct := float64(otherUsed) / float64(total) * 100
 				usedPct := float64(otherUsed+uint64(disk.Used)) / float64(total) * 100
-				sb.WriteString(fmt.Sprintf("    %-12s %s total | %.1f%% used | %s Fidrua ate\n",
-					disk.MountPoint, formatBytes(total), usedPct, formatBytes(uint64(disk.Used))))
+				if otherPct >= targetUsagePct {
+					// Already over target, show warning
+					sb.WriteString(fmt.Sprintf("    %-12s %s total | %.1f%% used | \033[33mskipped (already %.1f%%)\033[0m\n",
+						disk.MountPoint, formatBytes(total), usedPct, otherPct))
+				} else {
+					sb.WriteString(fmt.Sprintf("    %-12s %s total | %.1f%% used | %s Fidrua ate\n",
+						disk.MountPoint, formatBytes(total), usedPct, formatBytes(uint64(disk.Used))))
+				}
 			}
 		}
 		rc.mu.Unlock()

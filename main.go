@@ -18,6 +18,7 @@ import (
 
 const (
 	statusFile    = "/tmp/fidrua.status"
+	pidFile       = "/tmp/fidrua.pid"
 	chunkSize     = 10 * 1024 * 1024  // 10MB per memory chunk
 	checkInterval = 2 * time.Second
 )
@@ -169,6 +170,69 @@ func (rc *ResourceConsumer) detectDisks() []*DiskInfo {
 	}
 
 	return disks
+}
+
+// cleanupStaleFiles removes data files from previous runs that weren't cleaned up properly
+func cleanupStaleFiles() {
+	// Check if another instance is actually running
+	if isProcessRunning() {
+		return // Don't clean if process is alive
+	}
+
+	// Clean up stale PID file
+	os.Remove(pidFile)
+	os.Remove(statusFile)
+
+	// Find and remove all fidrua data files
+	// Check all mount points
+	file, err := os.Open("/proc/mounts")
+	if err != nil {
+		return
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 2 {
+			continue
+		}
+		mountPoint := fields[1]
+		
+		// Look for fidrua data files in this mount point
+		matches, _ := filepath.Glob(filepath.Join(mountPoint, ".fidrua_feast*.dat"))
+		for _, f := range matches {
+			os.Remove(f)
+		}
+	}
+}
+
+// isProcessRunning checks if the PID in pidFile is still running
+func isProcessRunning() bool {
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		return false
+	}
+	
+	var pid int
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &pid); err != nil {
+		return false
+	}
+	
+	// Check if process exists
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	
+	// On Unix, FindProcess always succeeds, so we need to send signal 0 to check
+	err = process.Signal(syscall.Signal(0))
+	return err == nil
+}
+
+// writePidFile writes the current PID to the pid file
+func writePidFile() {
+	os.WriteFile(pidFile, []byte(fmt.Sprintf("%d", os.Getpid())), 0644)
 }
 
 // Get system memory info (returns total and used by OTHER processes)
@@ -578,6 +642,7 @@ func (rc *ResourceConsumer) cleanup() {
 	rc.setMemory(0)
 	rc.clearAllDisks()
 	os.Remove(statusFile)
+	os.Remove(pidFile)
 
 	if !rc.daemonMode {
 		fmt.Println("Fidrua is full. Bye bye!")
@@ -588,28 +653,11 @@ func (rc *ResourceConsumer) Stop() {
 	close(rc.stopChan)
 }
 
-// isAnotherInstanceRunning checks if another instance is running by looking at processes
+// isAnotherInstanceRunning checks if another instance is running
 func isAnotherInstanceRunning() bool {
-	// Get current PID
-	myPid := os.Getpid()
-	
-	// Use pgrep to find fidruafeast daemon processes
-	out, err := exec.Command("pgrep", "-f", "fidruafeast.*-daemon").Output()
-	if err != nil {
-		return false // No process found
-	}
-	
-	// Check if any PID is not ours
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if line == "" {
-			continue
-		}
-		var pid int
-		if _, err := fmt.Sscanf(line, "%d", &pid); err == nil {
-			if pid != myPid {
-				return true
-			}
-		}
+	// Check PID file - most reliable method
+	if isProcessRunning() {
+		return true
 	}
 	return false
 }
@@ -847,21 +895,27 @@ func uninstallSystemd() {
 	if err := os.Remove(statusFile); err == nil {
 		removed++
 	}
-	// Clean up all fidrua data files
-	matches, _ := filepath.Glob("/*/.fidrua_feast*.dat")
-	for _, f := range matches {
-		if err := os.Remove(f); err == nil {
-			removed++
-		}
+	if err := os.Remove(pidFile); err == nil {
+		removed++
 	}
-	// Also check common locations
-	for _, dir := range []string{"/tmp", "/", "/home"} {
-		local, _ := filepath.Glob(filepath.Join(dir, ".fidrua_feast*.dat"))
-		for _, f := range local {
-			if err := os.Remove(f); err == nil {
-				removed++
+	// Clean up all fidrua data files from all mount points
+	file, err := os.Open("/proc/mounts")
+	if err == nil {
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			fields := strings.Fields(scanner.Text())
+			if len(fields) < 2 {
+				continue
+			}
+			mountPoint := fields[1]
+			matches, _ := filepath.Glob(filepath.Join(mountPoint, ".fidrua_feast*.dat"))
+			for _, f := range matches {
+				if err := os.Remove(f); err == nil {
+					removed++
+				}
 			}
 		}
+		file.Close()
 	}
 	fmt.Printf("ok (%d files)\n", removed)
 
@@ -1149,11 +1203,30 @@ func main() {
 		defer fmt.Print("\033[?25h")
 	}
 
+	// Clean up stale files from previous abnormal exits
+	cleanupStaleFiles()
+
+	// Write PID file
+	writePidFile()
+
 	rc := NewResourceConsumer(*freeCPU, *freeMem, *freeDisk, *daemonMode)
 
-	// Handle signals
+	// Ensure cleanup on panic
+	defer func() {
+		if r := recover(); r != nil {
+			rc.cleanup()
+			panic(r) // re-panic after cleanup
+		}
+	}()
+
+	// Handle signals - catch as many as possible
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigChan, 
+		syscall.SIGINT,  // Ctrl+C
+		syscall.SIGTERM, // kill command
+		syscall.SIGHUP,  // terminal closed
+		syscall.SIGQUIT, // Ctrl+\
+	)
 
 	go func() {
 		<-sigChan

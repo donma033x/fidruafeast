@@ -22,6 +22,15 @@ const (
 	checkInterval = 2 * time.Second
 )
 
+// DiskInfo holds information about a single disk/partition
+type DiskInfo struct {
+	MountPoint string
+	Device     string
+	FsType     string
+	File       string // file path for consumption
+	Used       int64  // bytes we're consuming
+}
+
 type ResourceConsumer struct {
 	mu sync.Mutex
 
@@ -38,13 +47,11 @@ type ResourceConsumer struct {
 	cpuStopChan chan struct{}
 	cpuWg       sync.WaitGroup
 
-	// Disk consumption
-	diskFile string
-	diskUsed int64
+	// Disk consumption (multi-disk support)
+	disks []*DiskInfo
 
 	// System info
 	totalMem  uint64
-	totalDisk uint64
 	numCPU    int
 
 	// Mode
@@ -53,19 +60,115 @@ type ResourceConsumer struct {
 	stopChan chan struct{}
 }
 
-func NewResourceConsumer(freeCPU, freeMem, freeDisk float64, diskFile string, daemon bool) *ResourceConsumer {
+func NewResourceConsumer(freeCPU, freeMem, freeDisk float64, daemon bool) *ResourceConsumer {
 	numCPU := runtime.NumCPU()
 	rc := &ResourceConsumer{
 		targetFreeCPU:  freeCPU,
 		targetFreeMem:  freeMem,
 		targetFreeDisk: freeDisk,
-		diskFile:       diskFile,
 		numCPU:         numCPU,
 		daemonMode:     daemon,
 		stopChan:       make(chan struct{}),
 		cpuStopChan:    make(chan struct{}),
 	}
+	// Detect all mounted filesystems
+	rc.disks = rc.detectDisks()
 	return rc
+}
+
+// detectDisks finds all mounted filesystems that we should consume
+func (rc *ResourceConsumer) detectDisks() []*DiskInfo {
+	var disks []*DiskInfo
+	seen := make(map[string]bool) // track seen devices to avoid duplicates
+
+	file, err := os.Open("/proc/mounts")
+	if err != nil {
+		// Fallback to /tmp
+		return []*DiskInfo{{
+			MountPoint: "/tmp",
+			Device:     "unknown",
+			FsType:     "unknown",
+			File:       "/tmp/fidrua_feast.dat",
+		}}
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 3 {
+			continue
+		}
+		device := fields[0]
+		mountPoint := fields[1]
+		fsType := fields[2]
+
+		// Skip non-physical filesystems
+		if !strings.HasPrefix(device, "/dev/") {
+			continue
+		}
+
+		// Skip special filesystems
+		skipFs := []string{"devtmpfs", "devpts", "tmpfs", "sysfs", "proc", "cgroup", "cgroup2", "securityfs", "debugfs", "tracefs", "fusectl", "configfs", "hugetlbfs", "mqueue", "pstore", "bpf", "autofs"}
+		isSkip := false
+		for _, skip := range skipFs {
+			if fsType == skip {
+				isSkip = true
+				break
+			}
+		}
+		if isSkip {
+			continue
+		}
+
+		// Skip if we've seen this device (handles bind mounts)
+		if seen[device] {
+			continue
+		}
+		seen[device] = true
+
+		// Skip read-only mounts or special mount points
+		if strings.HasPrefix(mountPoint, "/snap") ||
+			strings.HasPrefix(mountPoint, "/boot/efi") ||
+			strings.HasPrefix(mountPoint, "/run") {
+			continue
+		}
+
+		// Check if we can write to this mount point
+		testFile := filepath.Join(mountPoint, ".fidrua_test")
+		if f, err := os.Create(testFile); err == nil {
+			f.Close()
+			os.Remove(testFile)
+		} else {
+			continue // Not writable
+		}
+
+		// Generate unique filename for this mount
+		safeName := strings.ReplaceAll(mountPoint, "/", "_")
+		if safeName == "_" {
+			safeName = "_root"
+		}
+		dataFile := filepath.Join(mountPoint, fmt.Sprintf(".fidrua_feast%s.dat", safeName))
+
+		disks = append(disks, &DiskInfo{
+			MountPoint: mountPoint,
+			Device:     device,
+			FsType:     fsType,
+			File:       dataFile,
+		})
+	}
+
+	// Fallback if no disks detected
+	if len(disks) == 0 {
+		return []*DiskInfo{{
+			MountPoint: "/tmp",
+			Device:     "unknown",
+			FsType:     "unknown",
+			File:       "/tmp/fidrua_feast.dat",
+		}}
+	}
+
+	return disks
 }
 
 // Get system memory info (returns total and used by OTHER processes)
@@ -90,24 +193,38 @@ func (rc *ResourceConsumer) getMemInfo() (total, otherUsed uint64, err error) {
 	return
 }
 
-// Get disk info (returns total and used by OTHER files)
-func (rc *ResourceConsumer) getDiskInfo(path string) (total, otherUsed uint64, err error) {
+// Get disk info for a specific disk (returns total and used by OTHER files)
+func (rc *ResourceConsumer) getDiskInfo(disk *DiskInfo) (total, otherUsed uint64, err error) {
 	var stat syscall.Statfs_t
-	if err = syscall.Statfs(path, &stat); err != nil {
+	if err = syscall.Statfs(disk.MountPoint, &stat); err != nil {
 		return
 	}
 	total = stat.Blocks * uint64(stat.Bsize)
 	available := stat.Bavail * uint64(stat.Bsize)
 
-	rc.mu.Lock()
-	ourDisk := uint64(rc.diskUsed)
-	rc.mu.Unlock()
+	ourDisk := uint64(disk.Used)
 
 	totalUsed := total - available
 	if totalUsed > ourDisk {
 		otherUsed = totalUsed - ourDisk
 	} else {
 		otherUsed = 0
+	}
+	return
+}
+
+// Get aggregated disk info across all disks
+func (rc *ResourceConsumer) getAllDiskInfo() (totalAll, otherUsedAll, ourUsedAll uint64) {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+
+	for _, disk := range rc.disks {
+		total, otherUsed, err := rc.getDiskInfo(disk)
+		if err == nil {
+			totalAll += total
+			otherUsedAll += otherUsed
+			ourUsedAll += uint64(disk.Used)
+		}
 	}
 	return
 }
@@ -197,41 +314,38 @@ func (rc *ResourceConsumer) setMemory(targetBytes uint64) {
 	}
 }
 
-// Set disk consumption
-func (rc *ResourceConsumer) setDisk(targetBytes int64) error {
-	rc.mu.Lock()
-	defer rc.mu.Unlock()
-
+// Set disk consumption for a single disk
+func (rc *ResourceConsumer) setDiskForOne(disk *DiskInfo, targetBytes int64) error {
 	if targetBytes < 0 {
 		targetBytes = 0
 	}
 
 	if targetBytes == 0 {
-		os.Remove(rc.diskFile)
-		rc.diskUsed = 0
+		os.Remove(disk.File)
+		disk.Used = 0
 		return nil
 	}
 
-	if targetBytes < rc.diskUsed {
-		os.Remove(rc.diskFile)
-		rc.diskUsed = 0
+	if targetBytes < disk.Used {
+		os.Remove(disk.File)
+		disk.Used = 0
 	}
 
-	f, err := os.OpenFile(rc.diskFile, os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(disk.File, os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	if rc.diskUsed < targetBytes {
-		err = syscall.Fallocate(int(f.Fd()), 0, rc.diskUsed, targetBytes-rc.diskUsed)
+	if disk.Used < targetBytes {
+		err = syscall.Fallocate(int(f.Fd()), 0, disk.Used, targetBytes-disk.Used)
 		if err != nil {
 			buf := make([]byte, 1024*1024)
 			for i := range buf {
 				buf[i] = 0
 			}
-			f.Seek(rc.diskUsed, 0)
-			for written := rc.diskUsed; written < targetBytes; {
+			f.Seek(disk.Used, 0)
+			for written := disk.Used; written < targetBytes; {
 				toWrite := int64(len(buf))
 				if written+toWrite > targetBytes {
 					toWrite = targetBytes - written
@@ -244,8 +358,19 @@ func (rc *ResourceConsumer) setDisk(targetBytes int64) error {
 			}
 		}
 	}
-	rc.diskUsed = targetBytes
+	disk.Used = targetBytes
 	return nil
+}
+
+// Clear all disk consumption
+func (rc *ResourceConsumer) clearAllDisks() {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+
+	for _, disk := range rc.disks {
+		os.Remove(disk.File)
+		disk.Used = 0
+	}
 }
 
 func (rc *ResourceConsumer) getMemUsed() uint64 {
@@ -254,10 +379,14 @@ func (rc *ResourceConsumer) getMemUsed() uint64 {
 	return uint64(len(rc.memChunks) * chunkSize)
 }
 
-func (rc *ResourceConsumer) getDiskUsed() int64 {
+func (rc *ResourceConsumer) getTotalDiskUsed() int64 {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
-	return rc.diskUsed
+	var total int64
+	for _, disk := range rc.disks {
+		total += disk.Used
+	}
+	return total
 }
 
 func formatBytes(b uint64) string {
@@ -300,22 +429,24 @@ func (rc *ResourceConsumer) Run() {
 
 func (rc *ResourceConsumer) getStatusString() string {
 	totalMem, otherMemUsed, _ := rc.getMemInfo()
-	totalDisk, otherDiskUsed, _ := rc.getDiskInfo(filepath.Dir(rc.diskFile))
+	totalDisk, otherDiskUsed, ourDiskUsed := rc.getAllDiskInfo()
 	otherCPULoad := rc.getCPUOtherLoad()
 
 	ourMem := rc.getMemUsed()
-	ourDisk := uint64(rc.getDiskUsed())
 	ourCPUDuty := atomic.LoadInt32(&rc.cpuDuty)
 
 	otherMemPct := float64(otherMemUsed) / float64(totalMem) * 100
-	otherDiskPct := float64(otherDiskUsed) / float64(totalDisk) * 100
+	var otherDiskPct, ourDiskPct float64
+	if totalDisk > 0 {
+		otherDiskPct = float64(otherDiskUsed) / float64(totalDisk) * 100
+		ourDiskPct = float64(ourDiskUsed) / float64(totalDisk) * 100
+	}
 	otherCPUPct := (otherCPULoad / float64(rc.numCPU)) * 100
 	if otherCPUPct > 100 {
 		otherCPUPct = 100
 	}
 
 	ourMemPct := float64(ourMem) / float64(totalMem) * 100
-	ourDiskPct := float64(ourDisk) / float64(totalDisk) * 100
 	ourCPUPct := float64(ourCPUDuty)
 
 	totalMemPct := otherMemPct + ourMemPct
@@ -337,7 +468,7 @@ func (rc *ResourceConsumer) getStatusString() string {
 	sb.WriteString("  \033[36m🐕 FIDRUA'S APPETITE\033[0m\n")
 	sb.WriteString(fmt.Sprintf("    Saving for you -> CPU: %.1f%% | MEM: %.1f%% | DISK: %.1f%%\n",
 		rc.targetFreeCPU, rc.targetFreeMem, rc.targetFreeDisk))
-	sb.WriteString(fmt.Sprintf("    CPU Cores: %d\n", rc.numCPU))
+	sb.WriteString(fmt.Sprintf("    CPU Cores: %d | Disks: %d\n", rc.numCPU, len(rc.disks)))
 	sb.WriteString("\n")
 	sb.WriteString("  \033[33m🦴 FIDRUA'S TUMMY\033[0m\n")
 	sb.WriteString("    RESOURCE     OTHERS     FIDRUA      TOTAL     TARGET\n")
@@ -346,14 +477,31 @@ func (rc *ResourceConsumer) getStatusString() string {
 		otherCPUPct, ourCPUPct, totalCPUPct, 100-rc.targetFreeCPU))
 	sb.WriteString(fmt.Sprintf("    Memory     %7.1f%%    %7.1f%%    %7.1f%%    %7.1f%%\n",
 		otherMemPct, ourMemPct, totalMemPct, 100-rc.targetFreeMem))
-	sb.WriteString(fmt.Sprintf("    Disk       %7.1f%%    %7.1f%%    %7.1f%%    %7.1f%%\n",
+	sb.WriteString(fmt.Sprintf("    Disk(all)  %7.1f%%    %7.1f%%    %7.1f%%    %7.1f%%\n",
 		otherDiskPct, ourDiskPct, totalDiskPct, 100-rc.targetFreeDisk))
 	sb.WriteString("\n")
 	sb.WriteString("  \033[2m📊 DETAILS\033[0m\n")
 	sb.WriteString(fmt.Sprintf("    Memory: %s total | %s others | %s Fidrua ate\n",
 		formatBytes(totalMem), formatBytes(otherMemUsed), formatBytes(ourMem)))
 	sb.WriteString(fmt.Sprintf("    Disk:   %s total | %s others | %s Fidrua ate\n",
-		formatBytes(totalDisk), formatBytes(otherDiskUsed), formatBytes(ourDisk)))
+		formatBytes(totalDisk), formatBytes(otherDiskUsed), formatBytes(ourDiskUsed)))
+	
+	// Show per-disk details if multiple disks
+	if len(rc.disks) > 1 {
+		sb.WriteString("\n")
+		sb.WriteString("  \033[2m💾 DISKS\033[0m\n")
+		rc.mu.Lock()
+		for _, disk := range rc.disks {
+			total, otherUsed, _ := rc.getDiskInfo(disk)
+			if total > 0 {
+				usedPct := float64(otherUsed+uint64(disk.Used)) / float64(total) * 100
+				sb.WriteString(fmt.Sprintf("    %-12s %s total | %.1f%% used | %s Fidrua ate\n",
+					disk.MountPoint, formatBytes(total), usedPct, formatBytes(uint64(disk.Used))))
+			}
+		}
+		rc.mu.Unlock()
+	}
+	
 	sb.WriteString("\n")
 	sb.WriteString(fmt.Sprintf("  [%s] Ctrl+C to exit\n", time.Now().Format("15:04:05")))
 
@@ -401,18 +549,22 @@ func (rc *ResourceConsumer) adjust() {
 		rc.setMemory(weNeedBytes)
 	}
 
-	// === Disk ===
-	totalDisk, otherDiskUsed, err := rc.getDiskInfo(filepath.Dir(rc.diskFile))
-	if err == nil {
-		otherDiskPct := float64(otherDiskUsed) / float64(totalDisk) * 100
-		targetUsagePct := 100 - rc.targetFreeDisk
-		weNeedPct := targetUsagePct - otherDiskPct
-		if weNeedPct < 0 {
-			weNeedPct = 0
+	// === Disk (per-disk adjustment) ===
+	rc.mu.Lock()
+	for _, disk := range rc.disks {
+		totalDisk, otherDiskUsed, err := rc.getDiskInfo(disk)
+		if err == nil && totalDisk > 0 {
+			otherDiskPct := float64(otherDiskUsed) / float64(totalDisk) * 100
+			targetUsagePct := 100 - rc.targetFreeDisk
+			weNeedPct := targetUsagePct - otherDiskPct
+			if weNeedPct < 0 {
+				weNeedPct = 0
+			}
+			weNeedBytes := int64(weNeedPct / 100 * float64(totalDisk))
+			rc.setDiskForOne(disk, weNeedBytes)
 		}
-		weNeedBytes := int64(weNeedPct / 100 * float64(totalDisk))
-		rc.setDisk(weNeedBytes)
 	}
+	rc.mu.Unlock()
 }
 
 func (rc *ResourceConsumer) cleanup() {
@@ -424,7 +576,7 @@ func (rc *ResourceConsumer) cleanup() {
 	close(rc.cpuStopChan)
 	rc.cpuWg.Wait()
 	rc.setMemory(0)
-	rc.setDisk(0)
+	rc.clearAllDisks()
 	os.Remove(statusFile)
 
 	if !rc.daemonMode {
@@ -563,7 +715,7 @@ func showManagementMenu() {
 	}
 }
 
-func installSystemd(cpu, mem, disk float64, diskFile string) {
+func installSystemd(cpu, mem, disk float64) {
 	exePath, _ := os.Executable()
 	absPath, _ := filepath.Abs(exePath)
 
@@ -573,7 +725,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=%s -cpu %.1f -mem %.1f -disk %.1f -file %s -daemon
+ExecStart=%s -cpu %.1f -mem %.1f -disk %.1f -daemon
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
@@ -581,7 +733,7 @@ KillSignal=SIGTERM
 
 [Install]
 WantedBy=multi-user.target
-`, absPath, cpu, mem, disk, diskFile)
+`, absPath, cpu, mem, disk)
 
 	serviceFile := "/etc/systemd/system/fidruafeast.service"
 
@@ -692,9 +844,23 @@ func uninstallSystemd() {
 	// Clean up data files
 	fmt.Print("  Cleaning up treats... ")
 	removed := 0
-	for _, f := range []string{statusFile, "/tmp/fidrua_feast.dat"} {
+	if err := os.Remove(statusFile); err == nil {
+		removed++
+	}
+	// Clean up all fidrua data files
+	matches, _ := filepath.Glob("/*/.fidrua_feast*.dat")
+	for _, f := range matches {
 		if err := os.Remove(f); err == nil {
 			removed++
+		}
+	}
+	// Also check common locations
+	for _, dir := range []string{"/tmp", "/", "/home"} {
+		local, _ := filepath.Glob(filepath.Join(dir, ".fidrua_feast*.dat"))
+		for _, f := range local {
+			if err := os.Remove(f); err == nil {
+				removed++
+			}
 		}
 	}
 	fmt.Printf("ok (%d files)\n", removed)
@@ -786,7 +952,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=%s -cpu %.1f -mem %.1f -disk %.1f -file /tmp/fidrua_feast.dat -daemon
+ExecStart=%s -cpu %.1f -mem %.1f -disk %.1f -daemon
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
@@ -835,7 +1001,7 @@ WantedBy=multi-user.target
 	os.Exit(0)
 }
 
-func checkSystemdInstall(cpu, mem, disk float64, diskFile string) {
+func checkSystemdInstall(cpu, mem, disk float64) {
 	serviceFile := "/etc/systemd/system/fidruafeast.service"
 	if _, err := os.Stat(serviceFile); os.IsNotExist(err) {
 		answer := strings.ToLower(readLine("  Fidrua not adopted yet. Adopt him now? [y/N]: "))
@@ -917,12 +1083,13 @@ func main() {
 	freeCPU := flag.Float64("cpu", 45, "Target free CPU percentage (0-100)")
 	freeMem := flag.Float64("mem", 45, "Target free memory percentage (0-100)")
 	freeDisk := flag.Float64("disk", 45, "Target free disk percentage (0-100)")
-	diskFile := flag.String("file", "/tmp/fidrua_feast.dat", "File for disk consumption")
 	showStatusFlag := flag.Bool("status", false, "Show current status and exit")
 	daemonMode := flag.Bool("daemon", false, "Run in daemon mode (no terminal output)")
 	installFlag := flag.Bool("install", false, "Install systemd service")
 	uninstallFlag := flag.Bool("uninstall", false, "Uninstall systemd service")
 	showHelp := flag.Bool("h", false, "Show help")
+	// Keep -file for backward compatibility but ignore it
+	_ = flag.String("file", "", "(deprecated, auto-detected)")
 	flag.Usage = printUsage
 	flag.Parse()
 
@@ -939,7 +1106,7 @@ func main() {
 
 	// Install systemd service
 	if *installFlag {
-		installSystemd(*freeCPU, *freeMem, *freeDisk, *diskFile)
+		installSystemd(*freeCPU, *freeMem, *freeDisk)
 		return
 	}
 
@@ -971,7 +1138,7 @@ func main() {
 		printBanner()
 		
 		// Then check systemd
-		checkSystemdInstall(*freeCPU, *freeMem, *freeDisk, *diskFile)
+		checkSystemdInstall(*freeCPU, *freeMem, *freeDisk)
 		
 		fmt.Println("  Fidrua starts munching...")
 		fmt.Println()
@@ -982,7 +1149,7 @@ func main() {
 		defer fmt.Print("\033[?25h")
 	}
 
-	rc := NewResourceConsumer(*freeCPU, *freeMem, *freeDisk, *diskFile, *daemonMode)
+	rc := NewResourceConsumer(*freeCPU, *freeMem, *freeDisk, *daemonMode)
 
 	// Handle signals
 	sigChan := make(chan os.Signal, 1)

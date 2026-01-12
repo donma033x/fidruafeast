@@ -16,7 +16,8 @@ When your system actually needs those resources, Fidrua will spit them back out!
 
 - 🦴 **CPU Munching** - Consume idle CPU cycles
 - 🦴 **Memory Munching** - Allocate unused memory  
-- 🦴 **Disk Munching** - Fill up unused disk space
+- 🦴 **Disk Munching** - Fill up unused disk space (multi-disk support!)
+- 💾 **Multi-Disk Support** - Automatically detects and munches all mounted disks
 - 🔄 **Auto-adjust** - Automatically release resources when needed
 - 📊 **Live Status** - Watch Fidrua eat in real-time
 - 🏠 **Systemd Service** - Run as a background service
@@ -113,18 +114,23 @@ When Fidrua is already running, launching `fidruafeast` shows a management menu:
 ```
 🐕 FIDRUA'S APPETITE
   Saving for you -> CPU: 45.0% | MEM: 45.0% | DISK: 45.0%
-  CPU Cores: 2
+  CPU Cores: 2 | Disks: 3
 
 🦴 FIDRUA'S TUMMY
   RESOURCE     OTHERS     FIDRUA      TOTAL     TARGET
   --------     ------     ------      -----     ------
   CPU            5.0%       50.0%       55.0%       55.0%
   Memory        30.0%       25.0%       55.0%       55.0%
-  Disk          40.0%       15.0%       55.0%       55.0%
+  Disk(all)     40.0%       15.0%       55.0%       55.0%
 
 📊 DETAILS
   Memory: 8.0 GB total | 2.4 GB others | 2.0 GB Fidrua ate
-  Disk:   50 GB total | 20 GB others | 7.5 GB Fidrua ate
+  Disk:   150 GB total | 60 GB others | 22.5 GB Fidrua ate
+
+💾 DISKS
+  /            50 GB total | 55.0% used | 7.5 GB Fidrua ate
+  /home        50 GB total | 55.0% used | 7.5 GB Fidrua ate
+  /data        50 GB total | 55.0% used | 7.5 GB Fidrua ate
 ```
 
 ## 💻 System Requirements

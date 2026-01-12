@@ -135,21 +135,11 @@ func (rc *ResourceConsumer) detectDisks() []*DiskInfo {
 			continue
 		}
 
-		// Check if we can write to this mount point
-		testFile := filepath.Join(mountPoint, ".fidrua_test")
-		if f, err := os.Create(testFile); err == nil {
-			f.Close()
-			os.Remove(testFile)
-		} else {
-			continue // Not writable
+		// Find a writable location on this mount
+		dataFile := findWritableLocation(mountPoint)
+		if dataFile == "" {
+			continue // No writable location found
 		}
-
-		// Generate unique filename for this mount
-		safeName := strings.ReplaceAll(mountPoint, "/", "_")
-		if safeName == "_" {
-			safeName = "_root"
-		}
-		dataFile := filepath.Join(mountPoint, fmt.Sprintf(".fidrua_feast%s.dat", safeName))
 
 		disks = append(disks, &DiskInfo{
 			MountPoint: mountPoint,
@@ -170,6 +160,41 @@ func (rc *ResourceConsumer) detectDisks() []*DiskInfo {
 	}
 
 	return disks
+}
+
+// findWritableLocation finds a writable path on the given mount point for our data file
+func findWritableLocation(mountPoint string) string {
+	// Generate safe name from mount point
+	safeName := strings.ReplaceAll(mountPoint, "/", "_")
+	if safeName == "_" {
+		safeName = "_root"
+	}
+	fileName := fmt.Sprintf(".fidrua_feast%s.dat", safeName)
+
+	// Try different locations in order of preference
+	candidates := []string{
+		filepath.Join(mountPoint, "tmp"),           // /mountpoint/tmp/
+		filepath.Join(mountPoint, "var", "tmp"),    // /mountpoint/var/tmp/
+		filepath.Join(mountPoint, ".cache"),        // /mountpoint/.cache/
+		mountPoint,                                  // /mountpoint/ (root of mount)
+	}
+
+	for _, dir := range candidates {
+		// Check if directory exists (or can be created for .cache)
+		if dir == filepath.Join(mountPoint, ".cache") {
+			os.MkdirAll(dir, 0755) // Try to create .cache if not exists
+		}
+
+		testFile := filepath.Join(dir, ".fidrua_test")
+		f, err := os.Create(testFile)
+		if err == nil {
+			f.Close()
+			os.Remove(testFile)
+			return filepath.Join(dir, fileName)
+		}
+	}
+
+	return "" // No writable location found
 }
 
 // cleanupStaleFiles removes data files from previous runs that weren't cleaned up properly

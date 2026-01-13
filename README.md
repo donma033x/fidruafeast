@@ -6,6 +6,10 @@
   <img src="assets/banner.png" alt="Fidrua munching on server" width="600">
 </p>
 
+<p align="center">
+  <a href="README_CN.md">中文</a> | English
+</p>
+
 ## 🤔 What is this?
 
 Some VPS providers reclaim "idle" resources from your server. FidruaFeast solves this by having Fidrua (a hungry Samoyed 🐕) munch on your idle CPU, memory, and disk - keeping them occupied so they won't be taken away.
@@ -44,8 +48,8 @@ sudo ./fidruafeast -install
 ### Build from Source
 
 ```bash
-git clone https://github.com/donma033x/fidruafeast.git
-cd fidruafeast
+git clone https://github.com/donma033x/FidruaFeast.git
+cd FidruaFeast
 go build -o fidruafeast main.go
 ```
 

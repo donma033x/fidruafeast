@@ -19,9 +19,105 @@ import (
 const (
 	statusFile    = "/tmp/fidrua.status"
 	pidFile       = "/tmp/fidrua.pid"
+	langFile      = "/tmp/fidrua.lang"
 	chunkSize     = 10 * 1024 * 1024  // 10MB per memory chunk
 	checkInterval = 2 * time.Second
 )
+
+// Language support
+type Lang int
+
+const (
+	LangEN Lang = iota
+	LangZH
+)
+
+var currentLang Lang = LangEN
+
+// Text returns localized string
+var texts = map[string][2]string{
+	// General
+	"select_lang":        {"Select language", "选择语言"},
+	"invalid_option":     {"Invalid option", "无效选项"},
+	"cancelled":          {"Cancelled", "已取消"},
+	"confirm_yes":        {"y", "y"},
+	"press_enter":        {"Press Enter to continue...", "按回车继续..."},
+	
+	// Main menu
+	"main_menu":          {"Main Menu", "主菜单"},
+	"opt_adopt":          {"Adopt Fidrua (install systemd service)", "领养 Fidrua (安装系统服务)"},
+	"opt_background":     {"Run in background (temporary)", "临时后台运行"},
+	"opt_foreground":     {"Run in foreground", "前台运行"},
+	"opt_quit":           {"Quit", "退出"},
+	"select_option":      {"Select option", "请选择"},
+	
+	// Service running menu
+	"service_running":    {"Fidrua is munching (systemd)", "Fidrua 正在运行 (系统服务)"},
+	"opt_view_status":    {"View status", "查看状态"},
+	"opt_stop_service":   {"Stop service", "停止服务"},
+	"opt_restart_service":{"Restart service", "重启服务"},
+	"opt_edit_config":    {"Edit configuration", "修改配置"},
+	"opt_uninstall":      {"Uninstall service", "卸载服务"},
+	
+	// Service stopped menu
+	"service_stopped":    {"Fidrua is installed but stopped", "Fidrua 已安装但未运行"},
+	"opt_start_service":  {"Start service", "启动服务"},
+	
+	// Background process menu
+	"bg_running":         {"Fidrua is munching (background)", "Fidrua 正在运行 (后台进程)"},
+	"opt_stop_bg":        {"Stop background process", "停止后台进程"},
+	
+	// Foreground controls
+	"fg_controls":        {"[b] Background  [s] Install service  [q] Quit", "[b] 转后台  [s] 安装服务  [q] 退出"},
+	"switching_bg":       {"Switching to background...", "正在切换到后台..."},
+	"bg_started":         {"Running in background. PID: %d", "已在后台运行，PID: %d"},
+	
+	// Actions
+	"stopping":           {"Stopping Fidrua...", "正在停止 Fidrua..."},
+	"starting":           {"Starting Fidrua...", "正在启动 Fidrua..."},
+	"restarting":         {"Restarting Fidrua...", "正在重启 Fidrua..."},
+	"munching":           {"Fidrua starts munching...", "Fidrua 开始吃资源..."},
+	"stopped":            {"Fidrua stopped", "Fidrua 已停止"},
+	"bye":                {"Fidrua is full. Bye bye!", "Fidrua 吃饱了，再见！"},
+	"spitting":           {"Fidrua spitting out resources...", "Fidrua 正在吐出资源..."},
+	
+	// Install
+	"adopt_title":        {"Adopt Fidrua", "领养 Fidrua"},
+	"enter_free_pct":     {"Enter target FREE percentage for each resource.", "输入每项资源要保留的空闲百分比"},
+	"use_default":        {"Press Enter to use default value.", "按回车使用默认值"},
+	"cpu_free":           {"CPU free %", "CPU 空闲 %"},
+	"mem_free":           {"Memory free %", "内存空闲 %"},
+	"disk_free":          {"Disk free %", "磁盘空闲 %"},
+	"config_summary":     {"Configuration", "配置摘要"},
+	"confirm_adopt":      {"Adopt Fidrua with these settings? [Y/n]", "使用这些设置领养 Fidrua? [Y/n]"},
+	"need_sudo":          {"Permission denied. Run with sudo", "权限不足，请使用 sudo 运行"},
+	"adopted":            {"Fidrua adopted and munching!", "Fidrua 已领养并开始工作！"},
+	
+	// Uninstall
+	"confirm_release":    {"Are you sure you want to release Fidrua? [y/N]", "确定要放生 Fidrua 吗? [y/N]"},
+	"releasing":          {"Releasing Fidrua...", "正在放生 Fidrua..."},
+	"released":           {"Fidrua released to the wild!", "Fidrua 已放归自然！"},
+	
+	// Status display
+	"appetite":           {"FIDRUA'S APPETITE", "FIDRUA 的胃口"},
+	"saving_for_you":     {"Saving for you", "为你保留"},
+	"tummy":              {"FIDRUA'S TUMMY", "FIDRUA 的肚子"},
+	"resource":           {"RESOURCE", "资源"},
+	"others":             {"OTHERS", "其他"},
+	"fidrua":             {"FIDRUA", "FIDRUA"},
+	"total":              {"TOTAL", "总计"},
+	"target":             {"TARGET", "目标"},
+	"details":            {"DETAILS", "详情"},
+	"disks":              {"DISKS", "磁盘"},
+	"ctrl_c_exit":        {"Ctrl+C to exit", "Ctrl+C 退出"},
+}
+
+func T(key string) string {
+	if t, ok := texts[key]; ok {
+		return t[currentLang]
+	}
+	return key
+}
 
 // DiskInfo holds information about a single disk/partition
 type DiskInfo struct {
@@ -233,31 +329,117 @@ func cleanupStaleFiles() {
 }
 
 // isProcessRunning checks if the PID in pidFile is still running
+// isProcessRunning checks if PID file process is alive AND is fidruafeast
 func isProcessRunning() bool {
+	pid := getRunningPid()
+	return pid > 0
+}
+
+// getRunningPid returns the PID if fidrua is running, 0 otherwise
+func getRunningPid() int {
 	data, err := os.ReadFile(pidFile)
 	if err != nil {
-		return false
+		return 0
 	}
 	
 	var pid int
 	if _, err := fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &pid); err != nil {
-		return false
+		return 0
 	}
 	
 	// Check if process exists
 	process, err := os.FindProcess(pid)
 	if err != nil {
-		return false
+		return 0
 	}
 	
 	// On Unix, FindProcess always succeeds, so we need to send signal 0 to check
-	err = process.Signal(syscall.Signal(0))
+	if err = process.Signal(syscall.Signal(0)); err != nil {
+		return 0
+	}
+	
+	// Verify it's actually fidruafeast by checking cmdline
+	cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return 0
+	}
+	if !strings.Contains(string(cmdline), "fidruafeast") && !strings.Contains(string(cmdline), "resource-consumer") {
+		return 0 // PID reused by another process
+	}
+	
+	return pid
+}
+
+// isSystemdInstalled checks if systemd service is installed
+func isSystemdInstalled() bool {
+	_, err := os.Stat("/etc/systemd/system/fidruafeast.service")
 	return err == nil
+}
+
+// isSystemdRunning checks if systemd service is running
+func isSystemdRunning() bool {
+	out, err := exec.Command("systemctl", "is-active", "fidruafeast").Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) == "active"
+}
+
+// SystemState represents the current state of fidrua
+type SystemState int
+
+const (
+	StateFirstRun      SystemState = iota // No service, no background process
+	StateServiceRunning                    // Systemd service is running
+	StateServiceStopped                    // Systemd installed but stopped
+	StateBackgroundRun                     // Background process running (no systemd)
+)
+
+// getSystemState determines current system state
+func getSystemState() SystemState {
+	serviceInstalled := isSystemdInstalled()
+	serviceRunning := isSystemdRunning()
+	bgRunning := isProcessRunning()
+	
+	if serviceInstalled {
+		if serviceRunning {
+			return StateServiceRunning
+		}
+		return StateServiceStopped
+	}
+	
+	if bgRunning {
+		return StateBackgroundRun
+	}
+	
+	return StateFirstRun
 }
 
 // writePidFile writes the current PID to the pid file
 func writePidFile() {
 	os.WriteFile(pidFile, []byte(fmt.Sprintf("%d", os.Getpid())), 0644)
+}
+
+// saveLang saves current language preference
+func saveLang() {
+	os.WriteFile(langFile, []byte(fmt.Sprintf("%d", currentLang)), 0644)
+}
+
+// loadLang loads language preference
+func loadLang() bool {
+	data, err := os.ReadFile(langFile)
+	if err != nil {
+		return false
+	}
+	var lang int
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &lang); err != nil {
+		return false
+	}
+	if lang == 0 || lang == 1 {
+		currentLang = Lang(lang)
+		return true
+	}
+	return false
 }
 
 // Get system memory info (returns total and used by OTHER processes)
@@ -796,14 +978,6 @@ func (rc *ResourceConsumer) Stop() {
 }
 
 // isAnotherInstanceRunning checks if another instance is running
-func isAnotherInstanceRunning() bool {
-	// Check PID file - most reliable method
-	if isProcessRunning() {
-		return true
-	}
-	return false
-}
-
 func showStatus() {
 	// Initial check
 	if _, err := os.ReadFile(statusFile); err != nil {
@@ -843,28 +1017,103 @@ func showStatus() {
 	}
 }
 
-func showManagementMenu() {
+// selectLanguage prompts user to select language
+func selectLanguage() {
+	green := "\033[32m"
+	cyan := "\033[36m"
+	reset := "\033[0m"
+	
+	fmt.Printf("\n  %s── Language / 语言 ──%s\n\n", cyan, reset)
+	fmt.Printf("  %s[1]%s English\n", green, reset)
+	fmt.Printf("  %s[2]%s 中文\n\n", green, reset)
+	
+	for {
+		choice := readLine("  Select / 选择: ")
+		switch choice {
+		case "1":
+			currentLang = LangEN
+			saveLang()
+			return
+		case "2":
+			currentLang = LangZH
+			saveLang()
+			return
+		default:
+			fmt.Println("  Invalid / 无效")
+		}
+	}
+}
+
+// showMainMenu shows the appropriate menu based on system state
+func showMainMenu() {
+	state := getSystemState()
+	
+	switch state {
+	case StateFirstRun:
+		showFirstRunMenu()
+	case StateServiceRunning:
+		showServiceRunningMenu()
+	case StateServiceStopped:
+		showServiceStoppedMenu()
+	case StateBackgroundRun:
+		showBackgroundMenu()
+	}
+}
+
+// showFirstRunMenu - no service, no background process
+func showFirstRunMenu() {
+	cyan := "\033[36m"
+	green := "\033[32m"
+	dim := "\033[2m"
+	reset := "\033[0m"
+
+	fmt.Printf("  %s── %s ──%s\n\n", cyan, T("main_menu"), reset)
+	fmt.Printf("  %s[1]%s %s\n", green, reset, T("opt_adopt"))
+	fmt.Printf("  %s[2]%s %s\n", green, reset, T("opt_background"))
+	fmt.Printf("  %s[3]%s %s\n", green, reset, T("opt_foreground"))
+	fmt.Printf("  %s[q]%s %s\n\n", green, reset, T("opt_quit"))
+
+	for {
+		choice := readLine(fmt.Sprintf("  %s%s:%s ", dim, T("select_option"), reset))
+		
+		switch strings.ToLower(choice) {
+		case "1":
+			interactiveSystemdInstall()
+			return
+		case "2":
+			startBackground()
+			return
+		case "3":
+			startForeground()
+			return
+		case "q", "quit", "exit", "":
+			return
+		default:
+			fmt.Printf("  %s%s%s\n", dim, T("invalid_option"), reset)
+		}
+	}
+}
+
+// showServiceRunningMenu - systemd service is running
+func showServiceRunningMenu() {
 	cyan := "\033[36m"
 	green := "\033[32m"
 	yellow := "\033[33m"
 	dim := "\033[2m"
 	reset := "\033[0m"
 
-	// Clear screen and show banner
-	fmt.Print("\033[2J\033[H")
-	printBanner()
-
-	fmt.Printf("  %s⚡ Fidrua is already munching!%s\n\n", yellow, reset)
-
-	fmt.Printf("  %s── Management Menu ──%s\n\n", cyan, reset)
-	fmt.Printf("  %s[1]%s Watch Fidrua eat\n", green, reset)
-	fmt.Printf("  %s[2]%s Stop Fidrua\n", green, reset)
-	fmt.Printf("  %s[3]%s Wake up Fidrua\n", green, reset)
-	fmt.Printf("  %s[4]%s Release Fidrua\n", green, reset)
-	fmt.Printf("  %s[q]%s Quit\n\n", green, reset)
+	fmt.Printf("  %s⚡ %s%s\n\n", yellow, T("service_running"), reset)
+	
+	fmt.Printf("  %s── %s ──%s\n\n", cyan, T("main_menu"), reset)
+	fmt.Printf("  %s[1]%s %s\n", green, reset, T("opt_view_status"))
+	fmt.Printf("  %s[2]%s %s\n", green, reset, T("opt_stop_service"))
+	fmt.Printf("  %s[3]%s %s\n", green, reset, T("opt_restart_service"))
+	fmt.Printf("  %s[4]%s %s\n", green, reset, T("opt_edit_config"))
+	fmt.Printf("  %s[5]%s %s\n", green, reset, T("opt_uninstall"))
+	fmt.Printf("  %s[q]%s %s\n\n", green, reset, T("opt_quit"))
 
 	for {
-		choice := readLine(fmt.Sprintf("  %sSelect option:%s ", dim, reset))
+		choice := readLine(fmt.Sprintf("  %s%s:%s ", dim, T("select_option"), reset))
 		
 		switch strings.ToLower(choice) {
 		case "1":
@@ -872,35 +1121,303 @@ func showManagementMenu() {
 			return
 		case "2":
 			fmt.Println()
-			fmt.Print("  Stopping Fidrua... ")
+			fmt.Printf("  %s ", T("stopping"))
 			if err := exec.Command("systemctl", "stop", "fidruafeast").Run(); err == nil {
 				fmt.Println("ok")
 			} else {
-				fmt.Println("failed (need sudo)")
+				fmt.Printf("failed (%s)\n", T("need_sudo"))
 			}
 			return
 		case "3":
 			fmt.Println()
-			fmt.Print("  Waking up Fidrua... ")
+			fmt.Printf("  %s ", T("restarting"))
 			if err := exec.Command("systemctl", "restart", "fidruafeast").Run(); err == nil {
 				fmt.Println("ok")
 			} else {
-				fmt.Println("failed (need sudo)")
+				fmt.Printf("failed (%s)\n", T("need_sudo"))
 			}
 			return
 		case "4":
+			editConfig()
+			return
+		case "5":
 			fmt.Println()
-			answer := strings.ToLower(readLine("  Are you sure you want to release Fidrua? [y/N]: "))
+			answer := strings.ToLower(readLine(fmt.Sprintf("  %s ", T("confirm_release"))))
 			if answer == "y" || answer == "yes" {
 				uninstallSystemd()
 			} else {
-				fmt.Println("  Cancelled.")
+				fmt.Printf("  %s\n", T("cancelled"))
 			}
 			return
 		case "q", "quit", "exit", "":
 			return
 		default:
-			fmt.Printf("  %sInvalid option. Enter 1-4 or q to quit.%s\n", dim, reset)
+			fmt.Printf("  %s%s%s\n", dim, T("invalid_option"), reset)
+		}
+	}
+}
+
+// showServiceStoppedMenu - systemd installed but stopped
+func showServiceStoppedMenu() {
+	cyan := "\033[36m"
+	green := "\033[32m"
+	yellow := "\033[33m"
+	dim := "\033[2m"
+	reset := "\033[0m"
+
+	fmt.Printf("  %s⏸ %s%s\n\n", yellow, T("service_stopped"), reset)
+	
+	fmt.Printf("  %s── %s ──%s\n\n", cyan, T("main_menu"), reset)
+	fmt.Printf("  %s[1]%s %s\n", green, reset, T("opt_start_service"))
+	fmt.Printf("  %s[2]%s %s\n", green, reset, T("opt_background"))
+	fmt.Printf("  %s[3]%s %s\n", green, reset, T("opt_foreground"))
+	fmt.Printf("  %s[4]%s %s\n", green, reset, T("opt_edit_config"))
+	fmt.Printf("  %s[5]%s %s\n", green, reset, T("opt_uninstall"))
+	fmt.Printf("  %s[q]%s %s\n\n", green, reset, T("opt_quit"))
+
+	for {
+		choice := readLine(fmt.Sprintf("  %s%s:%s ", dim, T("select_option"), reset))
+		
+		switch strings.ToLower(choice) {
+		case "1":
+			fmt.Println()
+			fmt.Printf("  %s ", T("starting"))
+			if err := exec.Command("systemctl", "start", "fidruafeast").Run(); err == nil {
+				fmt.Println("ok")
+			} else {
+				fmt.Printf("failed (%s)\n", T("need_sudo"))
+			}
+			return
+		case "2":
+			startBackground()
+			return
+		case "3":
+			startForeground()
+			return
+		case "4":
+			editConfig()
+			return
+		case "5":
+			fmt.Println()
+			answer := strings.ToLower(readLine(fmt.Sprintf("  %s ", T("confirm_release"))))
+			if answer == "y" || answer == "yes" {
+				uninstallSystemd()
+			} else {
+				fmt.Printf("  %s\n", T("cancelled"))
+			}
+			return
+		case "q", "quit", "exit", "":
+			return
+		default:
+			fmt.Printf("  %s%s%s\n", dim, T("invalid_option"), reset)
+		}
+	}
+}
+
+// showBackgroundMenu - background process running (no systemd)
+func showBackgroundMenu() {
+	cyan := "\033[36m"
+	green := "\033[32m"
+	yellow := "\033[33m"
+	dim := "\033[2m"
+	reset := "\033[0m"
+	
+	pid := getRunningPid()
+
+	fmt.Printf("  %s⚡ %s (PID: %d)%s\n\n", yellow, T("bg_running"), pid, reset)
+	
+	fmt.Printf("  %s── %s ──%s\n\n", cyan, T("main_menu"), reset)
+	fmt.Printf("  %s[1]%s %s\n", green, reset, T("opt_view_status"))
+	fmt.Printf("  %s[2]%s %s\n", green, reset, T("opt_stop_bg"))
+	fmt.Printf("  %s[3]%s %s\n", green, reset, T("opt_adopt"))
+	fmt.Printf("  %s[q]%s %s\n\n", green, reset, T("opt_quit"))
+
+	for {
+		choice := readLine(fmt.Sprintf("  %s%s:%s ", dim, T("select_option"), reset))
+		
+		switch strings.ToLower(choice) {
+		case "1":
+			showStatus()
+			return
+		case "2":
+			stopBackgroundProcess()
+			return
+		case "3":
+			// Stop background first, then install
+			stopBackgroundProcess()
+			interactiveSystemdInstall()
+			return
+		case "q", "quit", "exit", "":
+			return
+		default:
+			fmt.Printf("  %s%s%s\n", dim, T("invalid_option"), reset)
+		}
+	}
+}
+
+// stopBackgroundProcess stops the background fidrua process
+func stopBackgroundProcess() {
+	pid := getRunningPid()
+	if pid <= 0 {
+		return
+	}
+	
+	fmt.Printf("\n  %s ", T("stopping"))
+	process, err := os.FindProcess(pid)
+	if err == nil {
+		process.Signal(syscall.SIGTERM)
+		// Wait a bit for cleanup
+		time.Sleep(2 * time.Second)
+		fmt.Println("ok")
+	} else {
+		fmt.Println("failed")
+	}
+}
+
+// startBackground starts fidrua in background mode
+func startBackground() {
+	exePath, _ := os.Executable()
+	absPath, _ := filepath.Abs(exePath)
+	
+	// Get config values
+	cpu, mem, disk := getConfigValues()
+	
+	// Start in background
+	cmd := exec.Command(absPath, "-daemon", 
+		"-cpu", fmt.Sprintf("%.1f", cpu),
+		"-mem", fmt.Sprintf("%.1f", mem),
+		"-disk", fmt.Sprintf("%.1f", disk))
+	cmd.Start()
+	
+	time.Sleep(500 * time.Millisecond)
+	
+	// Check if started
+	pid := getRunningPid()
+	if pid > 0 {
+		fmt.Printf("\n  "+T("bg_started")+"\n\n", pid)
+	} else {
+		fmt.Println("\n  Failed to start\n")
+	}
+}
+
+// startForeground starts fidrua in foreground mode
+func startForeground() {
+	// Get config values
+	cpu, mem, disk := getConfigValues()
+	
+	// Set global flags for main() to continue
+	runForegroundAfterMenu = true
+	foregroundCPU = cpu
+	foregroundMem = mem
+	foregroundDisk = disk
+}
+
+// getConfigValues prompts for config if needed or returns defaults
+func getConfigValues() (cpu, mem, disk float64) {
+	dim := "\033[2m"
+	reset := "\033[0m"
+	cyan := "\033[36m"
+	
+	fmt.Println()
+	fmt.Printf("  %s── %s ──%s\n\n", cyan, T("adopt_title"), reset)
+	fmt.Printf("  %s%s%s\n", dim, T("enter_free_pct"), reset)
+	fmt.Printf("  %s%s%s\n\n", dim, T("use_default"), reset)
+	
+	cpu = readFloatWithDefault(fmt.Sprintf("  %s", T("cpu_free")), 45)
+	mem = readFloatWithDefault(fmt.Sprintf("  %s", T("mem_free")), 45)
+	disk = readFloatWithDefault(fmt.Sprintf("  %s", T("disk_free")), 45)
+	
+	return
+}
+
+// editConfig allows editing the systemd service config
+func editConfig() {
+	serviceFile := "/etc/systemd/system/fidruafeast.service"
+	
+	// Read current config
+	data, err := os.ReadFile(serviceFile)
+	if err != nil {
+		fmt.Printf("\n  Error reading config: %v\n", err)
+		return
+	}
+	
+	// Parse current values
+	var cpu, mem, disk float64 = 45, 45, 45
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "ExecStart=") {
+			parts := strings.Fields(line)
+			for i, p := range parts {
+				switch p {
+				case "-cpu":
+					if i+1 < len(parts) {
+						fmt.Sscanf(parts[i+1], "%f", &cpu)
+					}
+				case "-mem":
+					if i+1 < len(parts) {
+						fmt.Sscanf(parts[i+1], "%f", &mem)
+					}
+				case "-disk":
+					if i+1 < len(parts) {
+						fmt.Sscanf(parts[i+1], "%f", &disk)
+					}
+				}
+			}
+		}
+	}
+	
+	dim := "\033[2m"
+	reset := "\033[0m"
+	cyan := "\033[36m"
+	
+	fmt.Println()
+	fmt.Printf("  %s── %s ──%s\n\n", cyan, T("opt_edit_config"), reset)
+	fmt.Printf("  %s%s%s\n\n", dim, T("use_default"), reset)
+	
+	newCpu := readFloatWithDefault(fmt.Sprintf("  %s", T("cpu_free")), cpu)
+	newMem := readFloatWithDefault(fmt.Sprintf("  %s", T("mem_free")), mem)
+	newDisk := readFloatWithDefault(fmt.Sprintf("  %s", T("disk_free")), disk)
+	
+	if newCpu == cpu && newMem == mem && newDisk == disk {
+		fmt.Printf("\n  %s\n", T("cancelled"))
+		return
+	}
+	
+	// Update service file
+	exePath, _ := os.Executable()
+	absPath, _ := filepath.Abs(exePath)
+	
+	serviceContent := fmt.Sprintf(`[Unit]
+Description=FidruaFeast - Samoyed Resource Muncher
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%s -cpu %.1f -mem %.1f -disk %.1f -daemon
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
+`, absPath, newCpu, newMem, newDisk)
+	
+	if err := os.WriteFile(serviceFile, []byte(serviceContent), 0644); err != nil {
+		fmt.Printf("\n  %s\n", T("need_sudo"))
+		return
+	}
+	
+	exec.Command("systemctl", "daemon-reload").Run()
+	
+	fmt.Println()
+	answer := strings.ToLower(readLine(fmt.Sprintf("  %s ", T("opt_restart_service")+"? [Y/n]")))
+	if answer == "" || answer == "y" || answer == "yes" {
+		fmt.Printf("\n  %s ", T("restarting"))
+		if err := exec.Command("systemctl", "restart", "fidruafeast").Run(); err == nil {
+			fmt.Println("ok")
+		} else {
+			fmt.Println("failed")
 		}
 	}
 }
@@ -1197,17 +1714,6 @@ WantedBy=multi-user.target
 	os.Exit(0)
 }
 
-func checkSystemdInstall(cpu, mem, disk float64) {
-	serviceFile := "/etc/systemd/system/fidruafeast.service"
-	if _, err := os.Stat(serviceFile); os.IsNotExist(err) {
-		answer := strings.ToLower(readLine("  Fidrua not adopted yet. Adopt him now? [y/N]: "))
-		if answer == "y" || answer == "yes" {
-			interactiveSystemdInstall()
-		}
-		fmt.Println()
-	}
-}
-
 const version = "1.0.0"
 
 func printBanner() {
@@ -1275,6 +1781,26 @@ func printUsage() {
 	fmt.Printf("  %s$%s sudo fidruafeast -uninstall\n\n", yellow, reset)
 }
 
+// Global variable to track if we should run foreground after menu
+var runForegroundAfterMenu = false
+var foregroundCPU, foregroundMem, foregroundDisk float64 = 45, 45, 45
+
+// setupSignalHandler sets up signal handling for the consumer
+func setupSignalHandler(rc *ResourceConsumer) {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, 
+		syscall.SIGINT,  // Ctrl+C
+		syscall.SIGTERM, // kill command
+		syscall.SIGHUP,  // terminal closed
+		syscall.SIGQUIT, // Ctrl+\
+	)
+
+	go func() {
+		<-sigChan
+		rc.Stop()
+	}()
+}
+
 func main() {
 	freeCPU := flag.Float64("cpu", 45, "Target free CPU percentage (0-100)")
 	freeMem := flag.Float64("mem", 45, "Target free memory percentage (0-100)")
@@ -1296,18 +1822,21 @@ func main() {
 
 	// Show status
 	if *showStatusFlag {
+		loadLang()
 		showStatus()
 		return
 	}
 
 	// Install systemd service
 	if *installFlag {
+		loadLang()
 		installSystemd(*freeCPU, *freeMem, *freeDisk)
 		return
 	}
 
 	// Uninstall systemd service
 	if *uninstallFlag {
+		loadLang()
 		uninstallSystemd()
 		return
 	}
@@ -1317,41 +1846,55 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Check single instance
-	if isAnotherInstanceRunning() {
-		if *daemonMode {
+	// Daemon mode - skip interactive
+	if *daemonMode {
+		// Check if another instance is running
+		if isProcessRunning() {
 			fmt.Println("Error: Fidrua is already busy munching!")
 			os.Exit(1)
 		}
-		showManagementMenu()
+		
+		cleanupStaleFiles()
+		writePidFile()
+		
+		rc := NewResourceConsumer(*freeCPU, *freeMem, *freeDisk, true)
+		setupSignalHandler(rc)
+		rc.Run()
 		return
 	}
 
-	// Interactive mode setup
-	if !*daemonMode {
-		// Clear screen and show welcome first
+	// Interactive mode
+	// Clear screen and show banner
+	fmt.Print("\033[2J\033[H")
+	printBanner()
+	
+	// Load or select language
+	if !loadLang() {
+		selectLanguage()
 		fmt.Print("\033[2J\033[H")
 		printBanner()
-		
-		// Then check systemd
-		checkSystemdInstall(*freeCPU, *freeMem, *freeDisk)
-		
-		fmt.Println("  Fidrua starts munching...")
-		fmt.Println()
-		time.Sleep(1 * time.Second)
-		// Clear and hide cursor
-		fmt.Print("\033[2J\033[H\033[?25l")
-		// Show cursor on exit
-		defer fmt.Print("\033[?25h")
 	}
-
-	// Clean up stale files from previous abnormal exits
+	
+	// Show appropriate menu based on state
+	showMainMenu()
+	
+	// Check if user selected foreground run
+	if !runForegroundAfterMenu {
+		return
+	}
+	
+	// Run in foreground
+	fmt.Printf("\n  %s\n\n", T("munching"))
+	time.Sleep(1 * time.Second)
+	
+	// Clear and hide cursor
+	fmt.Print("\033[2J\033[H\033[?25l")
+	defer fmt.Print("\033[?25h")
+	
 	cleanupStaleFiles()
-
-	// Write PID file
 	writePidFile()
 
-	rc := NewResourceConsumer(*freeCPU, *freeMem, *freeDisk, *daemonMode)
+	rc := NewResourceConsumer(foregroundCPU, foregroundMem, foregroundDisk, false)
 
 	// Ensure cleanup on panic
 	defer func() {
@@ -1361,19 +1904,6 @@ func main() {
 		}
 	}()
 
-	// Handle signals - catch as many as possible
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, 
-		syscall.SIGINT,  // Ctrl+C
-		syscall.SIGTERM, // kill command
-		syscall.SIGHUP,  // terminal closed
-		syscall.SIGQUIT, // Ctrl+\
-	)
-
-	go func() {
-		<-sigChan
-		rc.Stop()
-	}()
-
+	setupSignalHandler(rc)
 	rc.Run()
 }
